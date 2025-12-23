@@ -338,6 +338,15 @@ class MainWindow(QMainWindow):
         self.spin_inactive_gpu.setSingleStep(5)
         gpu_thresholds_row.addWidget(self.spin_inactive_gpu)
 
+        paused_gpu_label = QLabel("Paused GPU threshold (%):")
+        paused_gpu_label.setObjectName("BodyLabel")
+        gpu_thresholds_row.addWidget(paused_gpu_label)
+
+        self.spin_paused_gpu = QSpinBox()
+        self.spin_paused_gpu.setRange(0, 100)
+        self.spin_paused_gpu.setSingleStep(5)
+        gpu_thresholds_row.addWidget(self.spin_paused_gpu)
+
         gpu_thresholds_row.addStretch()
         settings_layout.addLayout(gpu_thresholds_row)
 
@@ -362,6 +371,15 @@ class MainWindow(QMainWindow):
         self.spin_sample_interval.setRange(250, 10000)
         self.spin_sample_interval.setSingleStep(250)
         timing_row.addWidget(self.spin_sample_interval)
+
+        paused_stable_label = QLabel("Paused stable (seconds):")
+        paused_stable_label.setObjectName("BodyLabel")
+        timing_row.addWidget(paused_stable_label)
+
+        self.spin_paused_stable = QSpinBox()
+        self.spin_paused_stable.setRange(1, 120)
+        self.spin_paused_stable.setSingleStep(1)
+        timing_row.addWidget(self.spin_paused_stable)
 
         timing_row.addStretch()
         settings_layout.addLayout(timing_row)
@@ -397,7 +415,9 @@ class MainWindow(QMainWindow):
         self.chk_sound.setChecked(self.cfg.sound_enabled)
         self.spin_active_gpu.setValue(self.cfg.active_gpu_threshold)
         self.spin_inactive_gpu.setValue(self.cfg.inactive_gpu_threshold)
+        self.spin_paused_gpu.setValue(self.cfg.paused_gpu_threshold)
         self.spin_hold_seconds.setValue(self.cfg.inactive_hold_seconds)
+        self.spin_paused_stable.setValue(self.cfg.paused_stable_seconds)
         self.spin_sample_interval.setValue(self.cfg.sample_interval_ms)
         self._render_reminders()
         self._refresh_status()
@@ -437,7 +457,14 @@ class MainWindow(QMainWindow):
         # Update activity state pill
         activity_text = hw_state.activity_state if is_running else "IDLE"
         self.active_pill.setText(activity_text)
-        self.active_pill.setObjectName("StatusPillActive" if hw_state.activity_state == "ACTIVE" else "StatusPill")
+        # Set pill style based on state
+        if hw_state.activity_state == "ACTIVE":
+            pill_style = "StatusPillActive"
+        elif hw_state.activity_state == "PAUSED":
+            pill_style = "StatusPillPaused"  # Will use orange/yellow color
+        else:
+            pill_style = "StatusPill"
+        self.active_pill.setObjectName(pill_style)
         self.active_pill.setStyleSheet(self.theme.get_stylesheet())
 
         # Update metrics display
@@ -496,7 +523,9 @@ class MainWindow(QMainWindow):
         self.cfg.sound_enabled = self.chk_sound.isChecked()
         self.cfg.active_gpu_threshold = int(self.spin_active_gpu.value())
         self.cfg.inactive_gpu_threshold = int(self.spin_inactive_gpu.value())
+        self.cfg.paused_gpu_threshold = int(self.spin_paused_gpu.value())
         self.cfg.inactive_hold_seconds = int(self.spin_hold_seconds.value())
+        self.cfg.paused_stable_seconds = int(self.spin_paused_stable.value())
         self.cfg.sample_interval_ms = int(self.spin_sample_interval.value())
 
         self.store.save(self.cfg)

@@ -19,6 +19,8 @@ class AppConfig(BaseModel):
     inactive_gpu_threshold: int = 35
     inactive_hold_seconds: int = 10
     sample_interval_ms: int = 1000
+    paused_gpu_threshold: int = 60
+    paused_stable_seconds: int = 10
 
     def to_monitor_config(self) -> dict:
         return {
@@ -26,4 +28,6 @@ class AppConfig(BaseModel):
             "inactive_gpu_threshold": self.inactive_gpu_threshold,
             "inactive_hold_seconds": self.inactive_hold_seconds,
             "sample_interval_ms": self.sample_interval_ms,
+            "paused_gpu_threshold": self.paused_gpu_threshold,
+            "paused_stable_seconds": self.paused_stable_seconds,
         }

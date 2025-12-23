@@ -360,6 +360,11 @@ class Theme:
             color: {COLOR_ACCENTS["green"]};
         }}
 
+        QLabel#StatusPillPaused {{
+            background-color: {self._rgba(COLOR_ACCENTS["orange"], 0.15)};
+            color: {COLOR_ACCENTS["orange"]};
+        }}
+
         QLabel#StatusPillStopped {{
             background-color: {self._rgba(COLOR_ACCENTS["gray"], 0.15)};
             color: {colors["text_secondary"]};

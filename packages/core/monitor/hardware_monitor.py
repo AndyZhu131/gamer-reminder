@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Literal, Optional
 
@@ -22,7 +23,7 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
-ActivityState = Literal["IDLE", "ACTIVE", "SUSPECT_INACTIVE", "INACTIVE"]
+ActivityState = Literal["IDLE", "ACTIVE", "PAUSED", "SUSPECT_INACTIVE", "INACTIVE"]
 
 
 @dataclass
@@ -32,6 +33,8 @@ class HardwareMonitorConfig:
     inactive_gpu_threshold: int  # 0-100
     inactive_hold_seconds: int  # seconds
     sample_interval_ms: int  # milliseconds
+    paused_gpu_threshold: int  # 0-100
+    paused_stable_seconds: int  # seconds
 
 
 @dataclass
@@ -42,6 +45,7 @@ class HardwareMonitorState:
     current_metrics: Optional[HardwareMetrics] = None
     suspect_inactive_since_ms: Optional[int] = None
     last_event_type: Optional[str] = None  # For debouncing
+    paused_stable_since_ms: Optional[int] = None  # When stable GPU usage started
 
 
 class HardwareSessionMonitor:
@@ -65,6 +69,10 @@ class HardwareSessionMonitor:
 
         self._thread: Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
+        
+        # Track GPU usage history for variance detection (paused state)
+        # Store (timestamp_ms, gpu_utilization) tuples
+        self._gpu_history: deque[tuple[int, float]] = deque(maxlen=20)  # Keep last 20 samples
 
     @staticmethod
     def _parse_config(config: dict) -> HardwareMonitorConfig:
@@ -74,6 +82,8 @@ class HardwareSessionMonitor:
             inactive_gpu_threshold=config.get("inactive_gpu_threshold", 35),
             inactive_hold_seconds=config.get("inactive_hold_seconds", 10),
             sample_interval_ms=config.get("sample_interval_ms", 1000),
+            paused_gpu_threshold=config.get("paused_gpu_threshold", 60),
+            paused_stable_seconds=config.get("paused_stable_seconds", 10),
         )
 
     def on_event(self, cb: Callable[[dict], None]) -> None:
@@ -109,6 +119,7 @@ class HardwareSessionMonitor:
                 current_metrics=self._state.current_metrics,
                 suspect_inactive_since_ms=self._state.suspect_inactive_since_ms,
                 last_event_type=self._state.last_event_type,
+                paused_stable_since_ms=self._state.paused_stable_since_ms,
             )
 
     def start(self) -> None:
@@ -119,7 +130,9 @@ class HardwareSessionMonitor:
             self._state.activity_state = "IDLE"
             self._state.current_metrics = None
             self._state.suspect_inactive_since_ms = None
+            self._state.paused_stable_since_ms = None
             self._state.last_event_type = None
+            self._gpu_history.clear()
 
         if self._detector is None:
             self._emit_error("No detector provided")
@@ -136,6 +149,8 @@ class HardwareSessionMonitor:
             self._state.activity_state = "IDLE"
             self._state.current_metrics = None
             self._state.suspect_inactive_since_ms = None
+            self._state.paused_stable_since_ms = None
+            self._gpu_history.clear()
 
     def _emit(self, evt: dict) -> None:
         if self._event_cb:
@@ -144,6 +159,65 @@ class HardwareSessionMonitor:
     def _emit_error(self, msg: str) -> None:
         if self._error_cb:
             self._error_cb(msg)
+    
+    def _is_gpu_stable_around_threshold(
+        self, 
+        threshold: float, 
+        stable_window_ms: int,
+        variance_threshold: float = 5.0
+    ) -> tuple[bool, Optional[int]]:
+        """
+        Check if GPU usage has been stable (low variance) around threshold for stable_window_ms.
+        
+        Args:
+            threshold: Target GPU utilization threshold
+            stable_window_ms: Required duration of stability in milliseconds
+            variance_threshold: Maximum allowed variance (default 5%)
+        
+        Returns:
+            (is_stable, stable_since_ms): True if stable, and timestamp when stability started
+        """
+        if len(self._gpu_history) < 3:
+            return False, None
+        
+        # Filter samples within the stable window
+        now_ms = int(time.time() * 1000)
+        window_start_ms = now_ms - stable_window_ms
+        
+        # Get samples within the window
+        window_samples = [
+            (ts, util) for ts, util in self._gpu_history
+            if ts >= window_start_ms
+        ]
+        
+        if len(window_samples) < 3:
+            return False, None
+        
+        # Extract GPU values
+        gpu_values = [util for _, util in window_samples]
+        
+        # Check if values are around threshold (±variance_threshold)
+        threshold_min = threshold - variance_threshold
+        threshold_max = threshold + variance_threshold
+        
+        all_near_threshold = all(
+            threshold_min <= val <= threshold_max 
+            for val in gpu_values
+        )
+        
+        if not all_near_threshold:
+            return False, None
+        
+        # Check variance (standard deviation)
+        import statistics
+        if len(gpu_values) >= 2:
+            std_dev = statistics.stdev(gpu_values)
+            if std_dev > variance_threshold:
+                return False, None
+        
+        # Find when stability started (first sample in window)
+        stable_since_ms = window_samples[0][0]
+        return True, stable_since_ms
 
     def _run(self) -> None:
         """Main monitoring loop implementing state machine."""
@@ -166,10 +240,15 @@ class HardwareSessionMonitor:
                     # Fallback to CPU if GPU unavailable
                     effective_util = metrics.cpu_utilization
                     log.debug("Using CPU utilization (GPU unavailable)")
+                
+                # Track GPU history for paused detection (only if GPU available)
+                now_ms = int(time.time() * 1000)
+                if metrics.gpu_utilization is not None:
+                    with self._lock:
+                        self._gpu_history.append((now_ms, metrics.gpu_utilization))
 
                 # State machine transitions
                 current_state = state.activity_state
-                now_ms = int(time.time() * 1000)
 
                 if current_state == "IDLE":
                     if effective_util >= cfg.active_gpu_threshold:
@@ -196,19 +275,74 @@ class HardwareSessionMonitor:
                         # Transition to SUSPECT_INACTIVE
                         with self._lock:
                             self._state.activity_state = "SUSPECT_INACTIVE"
+                            self._state.paused_stable_since_ms = None
                             if self._state.suspect_inactive_since_ms is None:
                                 self._state.suspect_inactive_since_ms = now_ms
-                    # If still active, reset suspect timer
+                    # Check for paused condition (stable GPU around paused threshold)
+                    elif (not using_cpu_fallback and 
+                          metrics.gpu_utilization is not None):
+                        # Check if GPU usage is stable around paused threshold
+                        stable_window_ms = cfg.paused_stable_seconds * 1000
+                        is_stable, stable_since_ms = self._is_gpu_stable_around_threshold(
+                            cfg.paused_gpu_threshold,
+                            stable_window_ms,
+                            variance_threshold=5.0  # ±5% variance allowed
+                        )
+                        
+                        if is_stable and stable_since_ms is not None:
+                            # Transition to PAUSED
+                            with self._lock:
+                                self._state.activity_state = "PAUSED"
+                                if self._state.paused_stable_since_ms is None:
+                                    self._state.paused_stable_since_ms = stable_since_ms
+                                self._state.suspect_inactive_since_ms = None
+                            log.info(f"Game paused detected: GPU stable at {metrics.gpu_utilization:.1f}% around {cfg.paused_gpu_threshold}% threshold")
+                    # If still active, reset timers
                     elif effective_util >= cfg.active_gpu_threshold:
                         with self._lock:
                             self._state.suspect_inactive_since_ms = None
+                            self._state.paused_stable_since_ms = None
 
+                elif current_state == "PAUSED":
+                    # From PAUSED, check for recovery or further inactivity
+                    if effective_util >= cfg.active_gpu_threshold:
+                        # Recovery: back to ACTIVE (game resumed)
+                        with self._lock:
+                            self._state.activity_state = "ACTIVE"
+                            self._state.paused_stable_since_ms = None
+                            self._state.suspect_inactive_since_ms = None
+                        log.info("Game resumed: GPU utilization increased")
+                    elif effective_util <= cfg.inactive_gpu_threshold:
+                        # Transition to SUSPECT_INACTIVE (game may have ended)
+                        with self._lock:
+                            self._state.activity_state = "SUSPECT_INACTIVE"
+                            self._state.paused_stable_since_ms = None
+                            if self._state.suspect_inactive_since_ms is None:
+                                self._state.suspect_inactive_since_ms = now_ms
+                    # If still paused, check if stability is broken
+                    elif (not using_cpu_fallback and 
+                          metrics.gpu_utilization is not None):
+                        # Check if GPU usage is no longer stable
+                        stable_window_ms = cfg.paused_stable_seconds * 1000
+                        is_stable, _ = self._is_gpu_stable_around_threshold(
+                            cfg.paused_gpu_threshold,
+                            stable_window_ms,
+                            variance_threshold=5.0
+                        )
+                        if not is_stable:
+                            # GPU usage changed, return to ACTIVE
+                            with self._lock:
+                                self._state.activity_state = "ACTIVE"
+                                self._state.paused_stable_since_ms = None
+                            log.info("Game resumed: GPU usage variance detected")
+                
                 elif current_state == "SUSPECT_INACTIVE":
                     if effective_util >= cfg.active_gpu_threshold:
                         # Recovery: back to ACTIVE
                         with self._lock:
                             self._state.activity_state = "ACTIVE"
                             self._state.suspect_inactive_since_ms = None
+                            self._state.paused_stable_since_ms = None
                     elif effective_util <= cfg.inactive_gpu_threshold:
                         # Check if hold time elapsed
                         if state.suspect_inactive_since_ms is not None:
@@ -243,6 +377,7 @@ class HardwareSessionMonitor:
                         with self._lock:
                             self._state.activity_state = "ACTIVE"
                             self._state.suspect_inactive_since_ms = None
+                            self._state.paused_stable_since_ms = None
                             self._state.last_event_type = None  # Reset debounce
                         util_type = "CPU" if using_cpu_fallback else "GPU"
                         self._emit({

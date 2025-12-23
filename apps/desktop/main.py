@@ -1,3 +1,4 @@
+import signal
 import sys
 from PySide6.QtWidgets import QApplication
 
@@ -13,6 +14,17 @@ def main() -> None:
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()
+    
+    # Handle Ctrl+C gracefully (works on Unix/Linux/Mac)
+    # On Windows, Qt handles Ctrl+C automatically and triggers closeEvent
+    def signal_handler(sig, frame):
+        print("\nReceived interrupt signal (Ctrl+C), shutting down...")
+        win.close()
+    
+    # Register signal handler for Ctrl+C (Unix/Linux/Mac)
+    if hasattr(signal, 'SIGINT'):
+        signal.signal(signal.SIGINT, signal_handler)
+    
     sys.exit(app.exec())
 
 

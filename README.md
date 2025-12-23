@@ -25,9 +25,11 @@ A minimal Windows desktop app that monitors hardware utilization (GPU/CPU) to de
 - Basic logging: console + file (`%APPDATA%\GamerReminder\logs\app.log`)
 
 ## GPU Detection Notes
-- GPU detection uses Windows Performance Counters (PDH API)
-- If GPU counters are unavailable, the app automatically falls back to CPU-only mode
-- GPU detection may not work on all systems; CPU fallback ensures the app remains functional
+- GPU detection uses NVIDIA `nvidia-smi` CLI (NVIDIA GPUs only)
+- If `nvidia-smi` is unavailable or fails, the app automatically falls back to CPU-only mode
+- GPU availability is checked at runtime (not init-time), allowing automatic recovery if GPU becomes available
+- The app retries GPU detection every 10 seconds while monitoring if GPU was previously unavailable
+- CPU fallback ensures the app remains functional on systems without NVIDIA GPUs or when `nvidia-smi` is unavailable
 
 ## Repo Layout (monorepo-style)
 - `apps/desktop`: Desktop UI app (PySide6)
@@ -53,8 +55,8 @@ python -m apps.desktop
 ```
 
 ## Notes / TODO
-- GPU detection via PDH may not work on all systems. The app automatically falls back to CPU-only mode if GPU counters are unavailable.
+- GPU detection requires NVIDIA GPU with `nvidia-smi` CLI available. The app automatically falls back to CPU-only mode if unavailable.
 - Future improvements could include:
-  - Vendor-specific GPU APIs (NVIDIA/AMD/Intel) for more reliable GPU telemetry
-  - WMI-based GPU detection as an alternative to PDH
+  - AMD GPU support (via `rocm-smi` or similar)
+  - Intel GPU support (via `intel_gpu_top` or similar)
   - Per-process GPU utilization tracking

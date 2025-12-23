@@ -1,149 +1,96 @@
 """
-Windows hardware usage detector using PDH (Performance Data Helper) for GPU
+Windows hardware usage detector using NVIDIA nvidia-smi for GPU
 and psutil for CPU.
 
-GPU detection uses Windows Performance Counters via PDH API.
-Falls back to CPU-only if GPU counters are unavailable.
-
-TODO: GPU telemetry via PDH is limited and may not work on all systems.
-If GPU detection fails, the detector falls back to CPU-only mode which
-still functions but may be less accurate for gaming detection.
+GPU detection uses nvidia-smi CLI to query GPU utilization.
+Falls back to CPU-only if GPU is unavailable (runtime-checked, not init-time).
 """
 
 from __future__ import annotations
 
-import ctypes
 import logging
 import time
-from ctypes import wintypes
 from typing import Optional
 
 import psutil
 
 from .detector import ActivityDetector, HardwareMetrics
+from .nvidia_smi_sampler import NvidiaSmiGpuSampler
 
 log = logging.getLogger(__name__)
-
-# Windows PDH constants
-PDH_FMT_DOUBLE = 0x00002000
-
-# Load Windows DLLs
-try:
-    pdh_dll = ctypes.windll.pdh
-    _PDH_AVAILABLE = True
-except OSError:
-    _PDH_AVAILABLE = False
-    log.warning("PDH DLL not available, GPU detection disabled")
 
 
 class HardwareUsageDetector(ActivityDetector):
     """
-    Windows hardware detector using PDH for GPU and psutil for CPU.
+    Windows hardware detector using NVIDIA nvidia-smi for GPU and psutil for CPU.
     
-    GPU detection attempts to use Windows Performance Counters.
-    If GPU counters are unavailable, falls back to CPU-only mode.
-    
-    Note: GPU detection via PDH may not work on all systems. The detector
-    will automatically fall back to CPU-only mode if GPU counters are unavailable.
+    GPU availability is checked at runtime (not init-time). If nvidia-smi fails,
+    the detector automatically falls back to CPU-only mode and retries GPU
+    periodically (every 10 seconds) to detect recovery.
     """
 
     def __init__(self) -> None:
-        self._gpu_query: Optional[int] = None
-        self._gpu_counter: Optional[int] = None
-        self._gpu_available = False
-        self._gpu_counter_path: Optional[str] = None
+        """Initialize detector. GPU availability is checked at runtime, not here."""
+        self._gpu_sampler: Optional[NvidiaSmiGpuSampler] = None
+        self._gpu_available = False  # Runtime state (not init-time decision)
+        self._last_gpu_retry_time: float = 0.0
+        self._gpu_retry_interval: float = 10.0  # Retry GPU every 10 seconds if unavailable
         
-        if _PDH_AVAILABLE:
-            self._init_gpu_detection()
-        else:
-            log.info("PDH not available, using CPU-only mode")
-
-    def _init_gpu_detection(self) -> None:
-        """Initialize GPU detection via PDH. Falls back silently if unavailable."""
+        # Initialize NVIDIA GPU sampler (lightweight, doesn't fail if unavailable)
         try:
-            # Try common GPU utilization counter paths
-            # These paths vary by GPU vendor and Windows version
-            potential_paths = [
-                "\\GPU Engine(*engtype_3D*)\\Utilization Percentage",
-                "\\GPU Engine(*)\\Utilization Percentage",
-            ]
-            
-            query_handle = wintypes.HANDLE()
-            counter_handle = wintypes.HANDLE()
-            
-            # Open a query
-            result = pdh_dll.PdhOpenQueryW(None, 0, ctypes.byref(query_handle))
-            if result != 0:
-                log.debug("PDH query open failed, GPU detection unavailable")
-                return
-            
-            # Try to find a working GPU counter
-            for path in potential_paths:
-                result = pdh_dll.PdhAddCounterW(
-                    query_handle,
-                    path,
-                    0,
-                    ctypes.byref(counter_handle)
-                )
-                if result == 0:
-                    # Try to collect data to verify it works
-                    pdh_dll.PdhCollectQueryData(query_handle)
-                    time.sleep(0.1)  # Brief wait for data
-                    pdh_dll.PdhCollectQueryData(query_handle)
-                    
-                    # Check if we got valid data
-                    value = wintypes.DOUBLE()
-                    result = pdh_dll.PdhGetFormattedCounterValue(
-                        counter_handle,
-                        PDH_FMT_DOUBLE,
-                        None,
-                        ctypes.byref(value)
-                    )
-                    
-                    if result == 0:
-                        self._gpu_query = query_handle.value
-                        self._gpu_counter = counter_handle.value
-                        self._gpu_counter_path = path
-                        self._gpu_available = True
-                        log.info(f"GPU detection initialized using: {path}")
-                        return
-            
-            # If we got here, no GPU counter worked
-            pdh_dll.PdhCloseQuery(query_handle)
-            log.info("GPU counters not available, using CPU-only mode")
-            
+            self._gpu_sampler = NvidiaSmiGpuSampler()
+            # Optional: try to start (doesn't guarantee availability)
+            self._gpu_sampler.start()
+            log.info("NVIDIA GPU sampler initialized (availability checked at runtime)")
         except Exception as e:
-            log.warning(f"GPU detection initialization failed: {e}, using CPU-only mode")
-            self._gpu_available = False
+            log.warning(f"GPU sampler initialization failed: {e}, will use CPU-only mode")
+            self._gpu_sampler = None
 
     def sample(self) -> HardwareMetrics:
-        """Sample current GPU and CPU utilization."""
+        """
+        Sample current GPU and CPU utilization.
+        
+        GPU availability is checked at runtime. If GPU sampling fails,
+        automatically falls back to CPU and schedules retry.
+        """
         gpu_util: Optional[float] = None
         cpu_util: float = psutil.cpu_percent(interval=0.1)
         
-        if self._gpu_available and self._gpu_query and self._gpu_counter:
+        # Runtime GPU availability check
+        now = time.time()
+        should_try_gpu = (
+            self._gpu_sampler is not None and
+            (self._gpu_available or (now - self._last_gpu_retry_time >= self._gpu_retry_interval))
+        )
+        
+        if should_try_gpu:
             try:
-                # Collect query data
-                pdh_dll.PdhCollectQueryData(self._gpu_query)
+                gpu_util = self._gpu_sampler.sample()
                 
-                # Get formatted value
-                value = wintypes.DOUBLE()
-                result = pdh_dll.PdhGetFormattedCounterValue(
-                    self._gpu_counter,
-                    PDH_FMT_DOUBLE,
-                    None,
-                    ctypes.byref(value)
-                )
+                # Update availability state based on result
+                was_available = self._gpu_available
+                self._gpu_available = (gpu_util is not None)
                 
-                if result == 0:
-                    gpu_util = float(value.value)
-                    # Clamp to 0-100
-                    gpu_util = max(0.0, min(100.0, gpu_util))
-                else:
-                    log.debug(f"PDH GetFormattedCounterValue failed: {result}")
+                # Log state transitions only
+                if was_available != self._gpu_available:
+                    if self._gpu_available:
+                        log.info("GPU telemetry: AVAILABLE (switched from CPU fallback)")
+                    else:
+                        log.info("GPU telemetry: UNAVAILABLE (switching to CPU fallback)")
+                        self._last_gpu_retry_time = now  # Schedule retry
+                elif not self._gpu_available:
+                    # GPU unavailable, schedule retry
+                    self._last_gpu_retry_time = now
                     
             except Exception as e:
-                log.debug(f"GPU sampling error: {e}")
+                # GPU sampling failed
+                was_available = self._gpu_available
+                self._gpu_available = False
+                self._last_gpu_retry_time = now
+                
+                if was_available:
+                    log.info("GPU telemetry: UNAVAILABLE (switching to CPU fallback)")
+                # Don't log every failure to avoid spam
         
         return HardwareMetrics(
             gpu_utilization=gpu_util,
@@ -152,14 +99,24 @@ class HardwareUsageDetector(ActivityDetector):
         )
 
     def is_available(self) -> bool:
-        """Check if GPU metrics are available."""
+        """
+        Check if GPU metrics are currently available (runtime check).
+        This reflects the current state, not init-time availability.
+        """
         return self._gpu_available
+    
+    def get_telemetry_source(self) -> str:
+        """
+        Get the current telemetry source string.
+        Returns "NVIDIA_SMI" if GPU is available, "CPU_FALLBACK" otherwise.
+        """
+        return "NVIDIA_SMI" if self._gpu_available else "CPU_FALLBACK"
 
     def __del__(self) -> None:
-        """Cleanup PDH resources."""
-        if self._gpu_query:
+        """Cleanup resources."""
+        if self._gpu_sampler:
             try:
-                pdh_dll.PdhCloseQuery(self._gpu_query)
+                self._gpu_sampler.close()
             except Exception:
                 pass
 

@@ -541,3 +541,19 @@ class MainWindow(QMainWindow):
             self._append_event(f"ERROR: {msg}")
             log.error("Monitor error: %s", msg)
         QTimer.singleShot(0, handle)
+    
+    def closeEvent(self, event) -> None:
+        """Handle window close event - cleanup resources."""
+        log.info("Closing application, cleaning up resources...")
+        # Stop monitoring if running
+        if self.monitor.get_state().status == "RUNNING":
+            self.monitor.stop()
+            log.info("Monitor stopped")
+        # Cleanup detector
+        if self.detector:
+            try:
+                if hasattr(self.detector, '_gpu_sampler') and self.detector._gpu_sampler:
+                    self.detector._gpu_sampler.close()
+            except Exception as e:
+                log.debug(f"Error cleaning up detector: {e}")
+        event.accept()

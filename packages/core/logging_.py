@@ -25,3 +25,9 @@ def setup_logging() -> None:
     fh.setLevel(logging.INFO)
     fh.setFormatter(fmt)
     root.addHandler(fh)
+    
+    # Set GPU detector modules to INFO level for console visibility
+    nvidia_smi_logger = logging.getLogger("packages.core.monitor.nvidia_smi_sampler")
+    nvidia_smi_logger.setLevel(logging.INFO)
+    hardware_logger = logging.getLogger("packages.core.monitor.hardware_detector")
+    hardware_logger.setLevel(logging.INFO)

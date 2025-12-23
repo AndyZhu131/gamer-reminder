@@ -296,6 +296,24 @@ class HardwareSessionMonitor:
                                 if self._state.paused_stable_since_ms is None:
                                     self._state.paused_stable_since_ms = stable_since_ms
                                 self._state.suspect_inactive_since_ms = None
+                            
+                            # Emit GAME_PAUSED (debounced: only once per transition)
+                            if state.last_event_type != "GAME_PAUSED":
+                                util_type = "CPU" if metrics.gpu_utilization is None else "GPU"
+                                util_str = f"{metrics.gpu_utilization:.1f}%" if metrics.gpu_utilization is not None else f"{effective_util:.1f}%"
+                                self._emit({
+                                    "type": "GAME_PAUSED",
+                                    "exe": "Gaming Session",
+                                    "at": _now_iso(),
+                                    "reason": f"{util_type} {util_str} stable around {cfg.paused_gpu_threshold}% for {cfg.paused_stable_seconds}s",
+                                    "metrics": {
+                                        "gpu": metrics.gpu_utilization,
+                                        "cpu": metrics.cpu_utilization,
+                                    }
+                                })
+                                with self._lock:
+                                    self._state.last_event_type = "GAME_PAUSED"
+                            
                             log.info(f"Game paused detected: GPU stable at {metrics.gpu_utilization:.1f}% around {cfg.paused_gpu_threshold}% threshold")
                     # If still active, reset timers
                     elif effective_util >= cfg.active_gpu_threshold:
@@ -311,6 +329,9 @@ class HardwareSessionMonitor:
                             self._state.activity_state = "ACTIVE"
                             self._state.paused_stable_since_ms = None
                             self._state.suspect_inactive_since_ms = None
+                            # Reset debounce to allow future paused events
+                            if self._state.last_event_type == "GAME_PAUSED":
+                                self._state.last_event_type = None
                         log.info("Game resumed: GPU utilization increased")
                     elif effective_util <= cfg.inactive_gpu_threshold:
                         # Transition to SUSPECT_INACTIVE (game may have ended)

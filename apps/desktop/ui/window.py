@@ -548,6 +548,20 @@ class MainWindow(QMainWindow):
             if t == "GAME_STARTED":
                 gpu_str = f"GPU {metrics.get('gpu', 'N/A')}%" if metrics.get('gpu') else "CPU fallback"
                 self._append_event(f"GAME_STARTED: {exe} ({reason})")
+            elif t == "GAME_PAUSED":
+                # Format metrics for log
+                gpu_val = metrics.get("gpu")
+                cpu_val = metrics.get("cpu", 0)
+                if gpu_val is not None:
+                    metrics_str = f"GPU {gpu_val:.1f}%, CPU {cpu_val:.1f}%"
+                else:
+                    metrics_str = f"CPU {cpu_val:.1f}% (GPU N/A)"
+                self._append_event(f"GAME_PAUSED: {exe} - {reason} [{metrics_str}]")
+                # Trigger reminders on pause (same as game ended)
+                payload = build_reminder_payload(reminders=self.cfg.reminders, session_name=exe, paused=True)
+                self.notifier.notify(payload["title"], payload["body"])
+                if self.cfg.sound_enabled:
+                    self.sound.play()
             elif t == "GAME_ENDED":
                 # Format metrics for log
                 gpu_val = metrics.get("gpu")
